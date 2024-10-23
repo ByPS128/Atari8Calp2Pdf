@@ -1,0 +1,24 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Atari8Calp2Pdf", "Atari8Calp2Pdf.csproj", "{AE4750FD-4F99-420C-8C8D-84038D7922ED}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "SolutionItems", "SolutionItems", "{8FFDD263-9B81-4842-9488-B451E8E69800}"
+	ProjectSection(SolutionItems) = preProject
+		.gitignore = .gitignore
+		LICENSE = LICENSE
+		README.md = README.md
+		.editorconfig = .editorconfig
+	EndProjectSection
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{AE4750FD-4F99-420C-8C8D-84038D7922ED}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{AE4750FD-4F99-420C-8C8D-84038D7922ED}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{AE4750FD-4F99-420C-8C8D-84038D7922ED}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{AE4750FD-4F99-420C-8C8D-84038D7922ED}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+EndGlobal
