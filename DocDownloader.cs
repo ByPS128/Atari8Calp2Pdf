@@ -1,10 +1,9 @@
-﻿using System.Text;
-using System.Text.RegularExpressions;
-using Atari8Calp2Pdf.Models;
+﻿using System.Collections.Immutable;
+using System.IO.Compression;
+using System.Text;
 using HtmlAgilityPack;
 using PdfSharp.Drawing;
 using PdfSharp.Pdf;
-using PdfSharp.Pdf.Annotations;
 using SixLabors.Fonts;
 using SixLabors.ImageSharp;
 using SixLabors.ImageSharp.Drawing.Processing;
@@ -16,14 +15,9 @@ namespace Atari8Calp2Pdf;
 
 public sealed class DocDownloader
 {
-    private const int ParallelismThreshold = 10; // 1 = single thread
-    private static readonly XFont _textFont = GetAtariXFont1(24);
-    private static readonly XFont _urlFont = GetAtariXFont1(16);
-    private static readonly Font _textAtariFont = GetFont("PressStart2P-vaV7", 24);
-    private static readonly Font _urlAtariFont = GetFont("PressStart2P-vaV7", 12);
-    private static string[] _acceptableImageExtensions = new[] {".gif", ".jpg", ".png"};
+    private static readonly string[] _acceptableImageExtensions = {".gif", ".jpg", ".png"};
 
-    public async Task<List<Publication>> GetPublicationsAsync()
+    public async Task<List<string>> GetPublicationsAsync()
     {
         var url = "http://www.atari8.cz/calp/list.php";
         var client = new HttpClient();
@@ -35,7 +29,7 @@ public sealed class DocDownloader
         var doc = new HtmlDocument();
         doc.LoadHtml(responseString);
 
-        var publications = new List<Publication>();
+        var publications = new List<string>();
         var contentDiv = doc.DocumentNode.SelectSingleNode("//div[@id='content']");
 
         if (contentDiv is not null)
@@ -47,16 +41,12 @@ public sealed class DocDownloader
                 foreach (var link in linkNodes)
                 {
                     var href = link.GetAttributeValue("href", string.Empty);
-                    var title = HtmlEntity.DeEntitize(link.InnerText).Trim();
                     var fullLink = new Uri(new Uri(url), href).ToString();
+                    var publicationFolderName = Path.GetFileName(fullLink.TrimEnd('/'));
 
-                    if (!publications.Any(p => p.Url == fullLink))
+                    if (publications.Any(p => p == publicationFolderName) is false)
                     {
-                        publications.Add(new Publication
-                        {
-                            Url = fullLink,
-                            Title = title
-                        });
+                        publications.Add(publicationFolderName);
                     }
                 }
             }
@@ -65,11 +55,11 @@ public sealed class DocDownloader
         return publications;
     }
 
-    public async Task ProcessPublicationsAsync(List<Publication> publications, bool includeFinalPage = true, bool renderMissingPagesAsImages = true)
+    public async Task ProcessPublicationsAsync(List<string> publications, int parallelismThreshold)
     {
         ArgumentNullException.ThrowIfNull(publications);
 
-        var semaphore = new SemaphoreSlim(ParallelismThreshold);
+        var semaphore = new SemaphoreSlim(parallelismThreshold);
         var tasks = new List<Task>();
 
         foreach (var publication in publications)
@@ -79,7 +69,7 @@ public sealed class DocDownloader
             {
                 try
                 {
-                    await ProcessPublicationAsync(publication, includeFinalPage, renderMissingPagesAsImages);
+                    await ProcessPublicationAsync(publication);
                 }
                 finally
                 {
@@ -91,14 +81,14 @@ public sealed class DocDownloader
         await Task.WhenAll(tasks);
     }
 
-    public async Task ProcessPublicationAsync(Publication publication, bool includeFinalPage, bool renderMissingPagesAsImages)
+    public async Task ProcessPublicationAsync(string publication)
     {
         ArgumentNullException.ThrowIfNull(publication);
 
         var client = new HttpClient();
 
         // Load the publication's index page
-        var indexUrl = publication.Url + "index.php?c=0";
+        var indexUrl = $"https://atari8.cz/calp/data/{publication}/index.php?c=0";
         byte[] responseBytes;
 
         try
@@ -112,100 +102,92 @@ public sealed class DocDownloader
         }
 
         var pageContent = Encoding.GetEncoding("windows-1250").GetString(responseBytes);
-
-        var title = publication.Title;
-
         var doc = new HtmlDocument();
         doc.LoadHtml(pageContent);
 
+        var title = publication;
         var titleNode = doc.DocumentNode.SelectSingleNode("//h1");
         if (titleNode != null)
         {
             title = HtmlEntity.DeEntitize(titleNode.InnerText.Trim());
         }
 
-        var sanitizedTitle = string.Join("-", title.Split(Path.GetInvalidFileNameChars()));
+        var sanitizedTitle = string.Join("-", title.Split(Path.GetInvalidFileNameChars())).Replace("»", "").Trim();
 
         // Create directory for images
-        var imagesDir = Path.Combine("Downloads", sanitizedTitle);
+        var imagesDir = Path.GetFullPath(Path.Combine("Downloads", publication));
         Directory.CreateDirectory(imagesDir);
-
-        // Get total number of pages
-        var totalPages = await GetTotalPagesAsync(publication.Url, client);
-
         // Download images or generate text pages
-        var imageFiles = await DownloadImagesAsync(publication.Url, totalPages, imagesDir, client, renderMissingPagesAsImages);
+        var imageFiles = await DownloadImagesAsync(publication, imagesDir, title, client);
 
         if (imageFiles.Count == 0)
         {
-            Console.WriteLine($"No images found for {title}");
             return;
         }
 
         // Create PDF
-        CreatePdfFromImages(imageFiles, Path.Combine("Downloads", sanitizedTitle + ".pdf"), includeFinalPage, publication.Url);
+        CreatePdfFromImages(imageFiles, Path.Combine("Downloads", $"{sanitizedTitle}.pdf"), publication);
+        DeleteFiles(imageFiles);
+        Directory.Delete(imagesDir, true);
 
         Console.WriteLine($"Completed: {title}");
     }
 
-    private void CreatePdfFromImages(List<string> imageFiles, string pdfPath, bool includeFinalPage, string publicationUrl)
+    private void CreatePdfFromImages(IReadOnlyList<string> imageFiles, string pdfPath, string publicationUrl)
     {
-        using (var document = new PdfDocument())
+        using var document = new PdfDocument();
+        // Some archices contails php files, so we need to filter only images.
+        var filesToWorkWith = imageFiles.Where(f => _acceptableImageExtensions.Contains(Path.GetExtension(f))).ToList();
+        foreach (var imageFile in filesToWorkWith)
         {
-            foreach (var imageFile in imageFiles)
+            var page = document.AddPage();
+            using var xGraphics = XGraphics.FromPdfPage(page);
+            var imagePath = imageFile;
+
+            // Convert GIF to PNG if necessary
+            if (Path.GetExtension(imageFile).Equals(".gif", StringComparison.OrdinalIgnoreCase))
             {
-                var page = document.AddPage();
-                using (var xGraphics = XGraphics.FromPdfPage(page))
-                {
-                    if (imageFile.StartsWith("text_page_"))
-                    {
-                        var pageIndex = int.Parse(imageFile.Replace("text_page_", ""));
-                        DrawMissingPageText(xGraphics, page, pageIndex, publicationUrl);
-                    }
-                    else
-                    {
-                        var imagePath = imageFile;
-
-                        // Convert GIF to PNG if necessary
-                        if (Path.GetExtension(imageFile).Equals(".gif", StringComparison.OrdinalIgnoreCase))
-                        {
-                            imagePath = ConvertGifToPngWithImageSharp(imageFile);
-                        }
-
-                        using (var xImage = XImage.FromFile(imagePath))
-                        {
-                            // Fit the image to the page
-                            double xRatio = page.Width / xImage.PixelWidth;
-                            double yRatio = page.Height / xImage.PixelHeight;
-                            var ratio = Math.Min(xRatio, yRatio);
-                            var width = xImage.PixelWidth * ratio;
-                            var height = xImage.PixelHeight * ratio;
-                            double x = (page.Width - width) / 2;
-                            double y = (page.Height - height) / 2;
-
-                            xGraphics.DrawImage(xImage, x, y, width, height);
-                        }
-
-                        // Delete temporary PNG if created
-                        if (imagePath != imageFile && File.Exists(imagePath))
-                        {
-                            File.Delete(imagePath);
-                        }
-                    }
-                }
+                imagePath = ConvertGifToPngWithImageSharp(imageFile);
             }
 
-            // Add final page if requested
-            if (includeFinalPage)
+            try
             {
-                var page = document.AddPage();
-                using (var xGraphics = XGraphics.FromPdfPage(page))
+                using var xImage = XImage.FromFile(imagePath);
+                // Fit the image to the page
+                double xRatio = page.Width / xImage.PixelWidth;
+                double yRatio = page.Height / xImage.PixelHeight;
+                var ratio = Math.Min(xRatio, yRatio);
+                var width = xImage.PixelWidth * ratio;
+                var height = xImage.PixelHeight * ratio;
+                double x = (page.Width - width) / 2;
+                double y = (page.Height - height) / 2;
+
+                xGraphics.DrawImage(xImage, x, y, width, height);
+
+                // Delete temporary PNG if created
+                if (imagePath != imageFile && File.Exists(imagePath))
                 {
-                    DrawFinalPage(xGraphics, page, publicationUrl);
+                    File.Delete(imagePath);
                 }
             }
+            catch (Exception ex)
+            {
+                Environment.FailFast($"Error adding image {imagePath}: {ex.Message}");
+            }
+        }
 
-            document.Save(pdfPath);
+        document.Save(pdfPath);
+    }
+
+    private void DeleteFiles(IReadOnlyList<string> filesToDelete)
+    {
+        // nyní smažeme všechny soubory v proměnné filesToDelete
+        foreach (var file in filesToDelete)
+        {
+            if (File.Exists(file))
+            {
+                File.Delete(file);
+            }
         }
     }
 
@@ -221,131 +203,84 @@ public sealed class DocDownloader
         return pngPath;
     }
 
-    private async Task<int> GetTotalPagesAsync(string publicationUrl, HttpClient client)
+    private async Task<IReadOnlyList<string>> DownloadImagesAsync(string publication, string imagesDir, string title, HttpClient client)
     {
-        var indexUrl = publicationUrl + "index.php?c=1";
+        // https://atari8.cz/calp/data/pha_91_4/down/pha_91_4.cbz 
+
+        // připravím si stažení archivu
+        var publicationUrl = CalculatePublicationUrl(publication);
+        var publicationFolderName = imagesDir;
+        var cbzArchiveFileName = Path.Combine(publicationFolderName, $"{publication}.cbz");
+        var cbzArchiveUrl = $"https://atari8.cz/calp/data/{publication}/down/{publication}.cbz";
+
+        // stáhnu archiv, zapíšu na disk a rozbalím ho
+        var cbzResponse = await client.GetAsync(cbzArchiveUrl);
+        var archiveContentBytes = await cbzResponse.Content.ReadAsByteArrayAsync();
+        await File.WriteAllBytesAsync(cbzArchiveFileName, archiveContentBytes);
+
+        // Vytvořím proměnnou pro seznam souborů
+        var imageFiles = new List<string>();
+
+        // Rozbalím archiv tak, aby soubory v kořenu archivu byly v zadaném adresáři
         try
         {
-            var responseBytes = await client.GetByteArrayAsync(indexUrl);
-            var pageContent = Encoding.GetEncoding("windows-1250").GetString(responseBytes);
-
-            var doc = new HtmlDocument();
-            doc.LoadHtml(pageContent);
-
-            var counterNode = doc.DocumentNode.SelectSingleNode("//div[@class='counter']");
-            if (counterNode != null)
+            using (var archive = ZipFile.OpenRead(cbzArchiveFileName))
             {
-                var counterText = counterNode.InnerText.Trim(); // e.g., "1/26"
-                var parts = counterText.Split('/');
-                if (parts.Length == 2 && int.TryParse(parts[1], out var totalPages))
+                // Zjistím, jestli všechny položky mají stejný kořenový adresář
+                var rootFiles = archive.Entries
+                    //.Where(f => f.FullName.IndexOf('/') < 0)
+                    .Where(f => f.CompressedLength > 0)
+                    //.Distinct()
+                    .ToList();
+
+                foreach (var entry in rootFiles)
                 {
-                    return totalPages;
+                    var destinationFileName = Path.GetFullPath(Path.Combine(imagesDir, Path.GetFileName(entry.FullName)));
+                    entry.ExtractToFile(destinationFileName, true);
+
+                    // Přidám soubor do seznamu
+                    imageFiles.Add(destinationFileName);
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
-            Console.WriteLine($"Cannot get total pages for {publicationUrl}");
+            ConsoleWriteLineRed($"Error extracting archive {cbzArchiveFileName}: {ex.Message}");
         }
 
-        return 0;
+        // Smažu soubor s archivem
+        File.Delete(cbzArchiveFileName);
+
+        SortedDictionary(imageFiles);
+
+        var result = imageFiles.ToImmutableList();
+        if (result.Count == 0)
+        {
+            ConsoleWriteLineRed($"No images found for {title}, cannot create document.\n{cbzArchiveUrl}");
+            imageFiles.Add(GenerateImageNoImagesInDocument(title, publicationUrl, imagesDir));
+        }
+
+        return result;
     }
 
-    private async Task<List<string>> DownloadImagesAsync(string publicationUrl, int totalPages, string imagesDir, HttpClient client, bool renderMissingPagesAsImages)
+    private void ConsoleWriteLineRed(string message)
     {
-        var imageFiles = new List<string>();
-        Directory.CreateDirectory(imagesDir);
-
-        var imagesThatNBotFound = 0;
-        var lastNotFoundImageIndex = -1;
-
-        var baseImageUrl = publicationUrl.TrimEnd('/') + "/img/";
-
-        // Download the first page (if it exists)
-        foreach (var ext in _acceptableImageExtensions)
-        {
-            var firstImageUrl = baseImageUrl + "pg_000a" + ext;
-            var response = await client.GetAsync(firstImageUrl);
-            if (response.IsSuccessStatusCode)
-            {
-                var localPath = Path.Combine(imagesDir, "pg_000a" + ext);
-                var imageBytes = await response.Content.ReadAsByteArrayAsync();
-                await File.WriteAllBytesAsync(localPath, imageBytes);
-                imageFiles.Add(localPath);
-                break;
-            }
-        }
-
-        // Download other pages
-        var totalImagesIsUnknownm = totalPages == 0;
-        totalPages = totalPages == 0 ? 999 : totalPages;
-        for (var pageIndex = 1; pageIndex <= totalPages; pageIndex++)
-        {
-            var imageFound = false;
-            foreach (var ext in _acceptableImageExtensions)
-            {
-                var pageNumber = pageIndex.ToString("D3");
-                var imageUrl = baseImageUrl + "pg_" + pageNumber + ext;
-                var response = await client.GetAsync(imageUrl);
-
-                if (response.IsSuccessStatusCode)
-                {
-                    var localPath = Path.Combine(imagesDir, "pg_" + pageNumber + ext);
-                    var imageBytes = await response.Content.ReadAsByteArrayAsync();
-                    await File.WriteAllBytesAsync(localPath, imageBytes);
-                    imageFiles.Add(localPath);
-                    imageFound = true;
-                    break;
-                }
-            }
-
-            if (imageFound is false)
-            {
-                if (totalImagesIsUnknownm)
-                {
-                    imagesThatNBotFound++;
-                    // Pokud nenajdu obrázek 2x zas sebou a původně jsem nevěděl kolik obrázků mám tahat, tak končím.
-                    if (imagesThatNBotFound > 1 && lastNotFoundImageIndex == pageIndex - 1)
-                    {
-                        //totalPages = pageIndex - 1;
-                        break;
-                    }
-
-                    lastNotFoundImageIndex = pageIndex;
-                }
-
-                if (renderMissingPagesAsImages)
-                {
-                    // Create custom image for missing page
-                    var localPath = Path.Combine(imagesDir, $"missing_pg_{pageIndex.ToString("D3")}.png");
-                    CreateMissingPageImage(pageIndex, publicationUrl, localPath);
-                    imageFiles.Add(localPath);
-                }
-                else
-                {
-                    // Use a placeholder to indicate a text page
-                    imageFiles.Add($"text_page_{pageIndex}");
-                }
-            }
-            else
-            {
-                imagesThatNBotFound = 0;
-            }
-        }
-
-        // Remove the last image if the total number of images is unknown and the last image is a text page.
-        if (totalImagesIsUnknownm && imageFiles[imageFiles.Count-1].StartsWith("text_page_"))
-        {
-            imageFiles.RemoveAt(imageFiles.Count-1);
-        }
-
-        return imageFiles;
+        var foregroundColor = Console.ForegroundColor;
+        Console.ForegroundColor = ConsoleColor.Red;
+        ConsoleWriteLineRed(message);
+        Console.ForegroundColor = foregroundColor;
     }
 
-    private void CreateMissingPageImage_o(int pageIndex, string publicationUrl, string outputPath)
+    private string CalculatePublicationUrl(string publication)
+    {
+        return $"https://atari8.cz/calp/data/{publication}/";
+    }
+
+    private string GenerateImageNoImagesInDocument(string title, string publicationUrl, string imagesDir)
     {
         var width = 595; // A4 width in pixels at 72 DPI
         var height = 842; // A4 height in pixels at 72 DPI
+        var outputPath = Path.Combine(imagesDir, "empty-document.png");
 
         using (var image = new Image<Rgba32>(width, height))
         {
@@ -353,55 +288,15 @@ public sealed class DocDownloader
             {
                 ctx.Fill(Color.White); // Fill background with white color
 
-                var message = $"Stránka číslo {pageIndex} nebyla nalezena.";
-                var urlMessage = $"URL: {publicationUrl}index.php?c={pageIndex}";
+                var message = $"Publikace '{title}' neobsahuje žádné listy.";
+                var urlMessage = $"URL: {publicationUrl}";
 
-                // Load font
-                var fontCollection = new FontCollection();
-                // Use a system font
-                var font = GetAtariXFont1(24);
-                var urlFont = GetAtariXFont1(16);
-
+                // Načteme fonty
                 var f1 = GetFont("Courier New", 24);
                 var f2 = GetFont("Courier New", 12);
-                // Set options for drawing text
-                var textOptions = new TextOptions(f1)
-                {
-                    HorizontalAlignment = HorizontalAlignment.Center,
-                    VerticalAlignment = VerticalAlignment.Center,
-                    Origin = new PointF(width / 2, height / 2 - 20),
-                    WrappingLength = width - 40
-                };
-
-                // Draw the message
-                ctx.DrawText(message, f1, Color.Black, textOptions.Origin);
-
-                // Draw the URL below the message
-                textOptions.Font = f2;
-                textOptions.Origin = new PointF(width / 2, height / 2 + 20);
-                ctx.DrawText(urlMessage, f2, Color.Black, textOptions.Origin);
-            });
-
-            image.Save(outputPath);
-        }
-    }
-
-    private void CreateMissingPageImage(int pageIndex, string publicationUrl, string outputPath)
-    {
-        var width = 595; // A4 šířka v pixelech při 72 DPI
-        var height = 842; // A4 výška v pixelech při 72 DPI
-
-        var message = $"Stránka číslo {pageIndex} nebyla nalezena.";
-        var urlMessage = $"URL: {publicationUrl}index.php?c={pageIndex}";
-
-        using (var image = new Image<Rgba32>(width, height))
-        {
-            image.Mutate(ctx =>
-            {
-                ctx.Fill(Color.White); // Vyplníme pozadí bílou barvou
 
                 // Nastavíme RichTextOptions pro zprávu
-                var textOptions = new RichTextOptions(_textAtariFont)
+                var messageOptions = new RichTextOptions(f1)
                 {
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center,
@@ -410,10 +305,10 @@ public sealed class DocDownloader
                 };
 
                 // Vykreslíme zprávu
-                ctx.DrawText(textOptions, message, Color.Black);
+                ctx.DrawText(messageOptions, message, Color.Black);
 
                 // Nastavíme RichTextOptions pro URL
-                var urlOptions = new RichTextOptions(_urlAtariFont)
+                var urlOptions = new RichTextOptions(f2)
                 {
                     HorizontalAlignment = HorizontalAlignment.Center,
                     VerticalAlignment = VerticalAlignment.Center,
@@ -426,193 +321,44 @@ public sealed class DocDownloader
             });
 
             image.Save(outputPath);
+
+            return outputPath;
         }
     }
 
-    private void DrawMissingPageText(XGraphics gfx, PdfPage page, int pageIndex, string publicationUrl)
+    private void SortedDictionary(List<string> imageFiles)
     {
-        var message = $"Stránka číslo {pageIndex} nebyla nalezena.";
-        var url = $"{publicationUrl}index.php?c={pageIndex}";
-
-        // Vycentrujeme text
-        var messageSize = gfx.MeasureString(message, _textFont);
-        var urlSize = gfx.MeasureString(url, _urlFont);
-        var totalHeight = messageSize.Height + urlSize.Height + 20; // 20 pixelů mezera
-        double startY = (page.Height - totalHeight) / 2;
-
-        // Vykreslíme zprávu
-        double x = (page.Width - messageSize.Width) / 2;
-        gfx.DrawString(message, _textFont, XBrushes.Black, new XPoint(x, startY));
-
-        // Vykreslíme URL pod zprávu
-        double urlX = (page.Width - urlSize.Width) / 2;
-        var urlY = startY + messageSize.Height + 20;
-        gfx.DrawString(url, _urlFont, XBrushes.Blue, new XPoint(urlX, urlY));
-
-        // Vytvoříme klikací oblast pro URL
-        var linkAnnotation = new PdfLinkAnnotation(page.Owner)
+        imageFiles.Sort((x, y) =>
         {
-            Title = url
-        };
-        page.Annotations.Add(linkAnnotation);
-    }
+            var xFileName = Path.GetFileNameWithoutExtension(x);
+            var yFileName = Path.GetFileNameWithoutExtension(y);
 
-    private void DrawFinalPage(XGraphics gfx, PdfPage page, string publicationUrl)
-    {
-        var url = publicationUrl;
-
-        // Rozdělíme zprávu na řádky
-        string[] lines =
-        {
-            "Dokument byl sestaven aplikací Atari8CalpToPdf.",
-            "Zdroj dokumentu je na stránce:",
-            $"{publicationUrl}",
-            "",
-            "",
-            "",
-            "",
-            "Aplikace byla vyvinuta pomocí AI,",
-            "jmenovitě ChatGPT o1-preview,",
-            "pod dohledem vývojáře Petra Škalouda aka ByPS.",
-            "BIO: https://www.linkedin.com/in/skaloudpetr/",
-            "",
-            "",
-            "",
-            "Aplikace je naprogramovaná v .net jazyce C#",
-            "GIT repozitory je zde:",
-            "https://github.com/ByPS128/Atari8Calp2Pdf"
-        };
-
-        // Načteme font
-        var font = GetAtariXFont1(16);
-
-        // Připravíme regulární výraz pro nalezení URL
-        var urlRegex = new Regex(@"(https?://[^\s]+)", RegexOptions.Compiled);
-
-        // Vypočítáme celkovou výšku textu
-        double totalHeight = 0;
-        double lineSpacing = 5; // Mezera mezi řádky
-        var lineHeights = new List<double>();
-
-        foreach (var line in lines)
-        {
-            var lineHeight = font.GetHeight();
-            lineHeights.Add(lineHeight);
-            totalHeight += lineHeight + lineSpacing;
-        }
-
-        totalHeight -= lineSpacing; // Odečteme poslední mezeru
-
-        // Vypočítáme počáteční Y pozici pro vertikální vystředění
-        double startY = (page.Height - totalHeight) / 2;
-
-        // Vykreslíme každý řádek
-        var y = startY + font.Height;
-        for (var i = 0; i < lines.Length; i++)
-        {
-            var line = lines[i];
-            var lineHeight = lineHeights[i];
-
-            // Najdeme URL v řádku
-            List<(string text, bool isUrl)> parts = new ();
-            var lastIndex = 0;
-            foreach (Match match in urlRegex.Matches(line))
+            // Pokud je x 'pg_000a', umístíme ho na první místo
+            if (xFileName.Equals("pg_000a", StringComparison.OrdinalIgnoreCase))
             {
-                if (match.Index > lastIndex)
-                {
-                    // Přidáme text před URL
-                    var textBefore = line.Substring(lastIndex, match.Index - lastIndex);
-                    parts.Add((textBefore, false));
-                }
-
-                // Přidáme URL
-                parts.Add((match.Value, true));
-                lastIndex = match.Index + match.Length;
+                return -1;
             }
 
-            if (lastIndex < line.Length)
+            // Pokud je y 'pg_000a', umístíme ho na první místo
+            if (yFileName.Equals("pg_000a", StringComparison.OrdinalIgnoreCase))
             {
-                // Přidáme zbytek textu po poslední URL
-                parts.Add((line.Substring(lastIndex), false));
+                return 1;
             }
 
-            // Vypočítáme celkovou šířku řádku
-            double lineWidth = 0;
-            var partWidths = new List<double>();
-            foreach (var part in parts)
-            {
-                var size = gfx.MeasureString(part.text, font);
-                partWidths.Add(size.Width);
-                lineWidth += size.Width;
-            }
-
-            // Vypočítáme počáteční X pozici pro horizontální vystředění
-            double x = (page.Width - lineWidth) / 2;
-
-            // Vykreslíme jednotlivé části řádku
-            var xPos = x;
-            for (var j = 0; j < parts.Count; j++)
-            {
-                var part = parts[j];
-                var partWidth = partWidths[j];
-                if (part.isUrl)
-                {
-                    // Vykreslíme URL modře
-                    gfx.DrawString(part.text, font, XBrushes.Blue, new XPoint(xPos, y));
-
-                    // Vytvoříme klikací oblast pro URL
-                    var urlRect = new XRect(xPos, y - font.Height, partWidth, lineHeight);
-                    var link = PdfLinkAnnotation.CreateWebLink(new PdfRectangle(urlRect), url);
-                    link.Title = url;
-                    page.Annotations.Add(link);
-                }
-                else
-                {
-                    // Vykreslíme běžný text
-                    gfx.DrawString(part.text, font, XBrushes.Black, new XPoint(xPos, y));
-                }
-
-                xPos += partWidth;
-            }
-
-            // Posuneme se na další řádek
-            y += lineHeight + lineSpacing;
-        }
+            // Ostatní soubory seřadíme abecedně
+            return string.Compare(xFileName, yFileName, StringComparison.OrdinalIgnoreCase);
+        });
     }
 
     private static Font GetFont(string fontFamilyName, float size)
     {
-        var fontCollection = new FontCollection();
-        FontFamily family;
-
         // Nejprve se pokusíme najít font v systémových fontech
-        if (SystemFonts.TryGet(fontFamilyName, out family))
+        if (SystemFonts.TryGet(fontFamilyName, out var family))
         {
-            return family.CreateFont(size);
-        }
-
-        // Pokud není nalezen v "systémových" fontech, pokusíme se jej načíst ze složky Fonts v aplikaci
-        var fontPath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Fonts", fontFamilyName + ".ttf");
-        if (File.Exists(fontPath))
-        {
-            family = fontCollection.Add(fontPath);
             return family.CreateFont(size);
         }
 
         // Pokud font není nalezen, použijeme výchozí font
         return SystemFonts.CreateFont("Arial", size);
-    }
-
-    private static XFont GetCourierXFont(double size, XFontStyleEx style = XFontStyleEx.Regular)
-    {
-        var fontFamilyName = "Courier New";
-        var font = new XFont(fontFamilyName, size, style, new XPdfFontOptions(PdfFontEncoding.Unicode, PdfFontEmbedding.EmbedCompleteFontFile));
-        return font;
-    }
-
-    private static XFont GetAtariXFont1(double size, XFontStyleEx style = XFontStyleEx.Regular)
-    {
-        var font = new XFont("AtariFont1", size / 2, style, new XPdfFontOptions(PdfFontEncoding.Unicode, PdfFontEmbedding.EmbedCompleteFontFile));
-        return font;
     }
 }
