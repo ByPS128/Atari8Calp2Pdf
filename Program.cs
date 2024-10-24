@@ -14,7 +14,8 @@ internal class Program
 
         // List<string> publicationLinks =
         // [
-        //     "man_tosprt"
+        //     "pha_92_2",
+        //     //"man_tosprt"
         // ];
 
         // Zpracujeme publikace, dopňující stránky vložíme jako text, nikoli jako obrázek.

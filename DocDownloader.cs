@@ -126,14 +126,15 @@ public sealed class DocDownloader
         }
 
         // Create PDF
-        CreatePdfFromImages(imageFiles, Path.Combine("Downloads", $"{sanitizedTitle}.pdf"), publication);
+        //CreatePdfFromImages(imageFiles, Path.Combine("Downloads", $"{sanitizedTitle}.pdf"));
+        CreatePdfFromImages(imageFiles, Path.Combine("Downloads", $"{publication}.pdf"));
         DeleteFiles(imageFiles);
         Directory.Delete(imagesDir, true);
 
         Console.WriteLine($"Completed: {title}");
     }
 
-    private void CreatePdfFromImages(IReadOnlyList<string> imageFiles, string pdfPath, string publicationUrl)
+    private void CreatePdfFromImages(IReadOnlyList<string> imageFiles, string pdfPath)
     {
         using var document = new PdfDocument();
         // Some archices contails php files, so we need to filter only images.
@@ -253,21 +254,20 @@ public sealed class DocDownloader
 
         SortedDictionary(imageFiles);
 
-        var result = imageFiles.ToImmutableList();
-        if (result.Count == 0)
+        if (imageFiles.Count == 0)
         {
             ConsoleWriteLineRed($"No images found for {title}, cannot create document.\n{cbzArchiveUrl}");
             imageFiles.Add(GenerateImageNoImagesInDocument(title, publicationUrl, imagesDir));
         }
 
-        return result;
+        return imageFiles.ToImmutableList();
     }
 
     private void ConsoleWriteLineRed(string message)
     {
         var foregroundColor = Console.ForegroundColor;
         Console.ForegroundColor = ConsoleColor.Red;
-        ConsoleWriteLineRed(message);
+        Console.WriteLine(message);
         Console.ForegroundColor = foregroundColor;
     }
 
